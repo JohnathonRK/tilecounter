@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Domino Pip Photo Analyzer (Simple)</title>
+<style>
+  :root{
+    --bg:#0b0b0b; --card:#151515; --text:#f2f2f2; --muted:#bdbdbd;
+    --accent:#7ee787; --focus:#58a6ff; --border:#2a2a2a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:12px 16px;border-bottom:1px solid var(--border);position:sticky;top:0;background:#0b0b0bcc;backdrop-filter:blur(8px)}
+  h1{font-size:1.2rem;margin:0 0 6px}
+  main{padding:12px 16px;max-width:900px;margin:0 auto}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px}
+  .videoWrap{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+  video{width:100%;height:auto;display:block;background:#000}
+  canvas{width:100%;height:auto;display:block;background:transparent}
+  .overlay{position:absolute;inset:0;pointer-events:none}
+  .muted{color:var(--muted)}
+  .stat{font-weight:700;color:var(--accent)}
+  button{
+    background:var(--focus); color:#0b0b0b; border:none; border-radius:12px;
+    padding:12px 16px; font-weight:700; cursor:pointer
+  }
+  button.secondary{background:#30363d;color:#f0f6fc;border:1px solid #39424a}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+  details{margin-top:10px}
+  summary{cursor:pointer}
+  .slimRow{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  input[type=range]{width:220px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Domino Pip Photo Analyzer</h1>
+  <div class="muted">Tip: use HTTPS or localhost. Take a clear photo of just your remaining tiles.</div>
+</header>
+
+<main>
+  <!-- Camera / Preview -->
+  <section class="card">
+    <div class="videoWrap">
+      <!-- added webkit-playsinline for iOS -->
+      <video id="cam" playsinline webkit-playsinline autoplay muted></video>
+      <canvas id="preview" class="overlay"></canvas>
+    </div>
+
+    <div class="actions" style="margin-top:12px">
+      <div class="row">
+        <button id="startBtn" type="button">▶️ Start Camera</button>
+        <button id="captureBtn" type="button" style="display:none">📸 Take Photo</button>
+        <button id="retakeBtn" class="secondary" type="button" style="display:none">↺ Retake</button>
+      </div>
+      <div class="row">
+        <button id="uploadBtn" class="secondary" type="button">⬆️ Upload Photo</button>
+        <input id="filePick" type="file" accept="image/*" capture="environment" style="display:none">
+      </div>
+    </div>
+
+    <div class="actions" style="margin-top:8px">
+      <div class="row">
+        <button id="analyzeBtn" type="button">🔎 Analyze</button>
+        <button id="autoBtn" type="button">🤖 Auto Analyze</button>
+      </div>
+      <div class="row">
+        <div>Detected Pips: <span id="pipCount" class="stat">0</span></div>
+      </div>
+    </div>
+
+    <div class="muted" id="status" style="margin-top:6px">Loading OpenCV…</div>
+    <div id="hint" class="muted" style="margin-top:4px;"></div>
+
+    <details>
+      <summary class="muted">Advanced (optional)</summary>
+      <div class="card" style="margin-top:10px">
+        <div class="slimRow">
+          <label>Threshold C: <span id="cVal">4</span></label>
+          <input id="cSlider" type="range" min="-10" max="10" step="1" value="4">
+        </div>
+        <div class="slimRow">
+          <label>Min Area: <span id="minAreaVal">30</span></label>
+          <input id="minArea" type="range" min="5" max="300" step="5" value="30">
+          <label>Max Area: <span id="maxAreaVal">2000</span></label>
+          <input id="maxArea" type="range" min="100" max="5000" step="50" value="2000">
+        </div>
+        <div class="slimRow">
+          <label>Min Circularity: <span id="circVal">0.50</span></label>
+          <input id="circSlider" type="range" min="0.3" max="0.95" step="0.05" value="0.50">
+        </div>
+        <div class="muted" style="margin-top:6px">
+          Tips: lower “Threshold C” for faint dots; increase “Min Area” to remove specks; increase “Min Circularity” to reject non-round blobs.
+        </div>
+      </div>
+    </details>
+  </section>
+</main>
+
+<!-- OpenCV.js -->
+<script async src="https://docs.opencv.org/4.x/opencv.js"
+        onload="cvIsLoading()" onerror="document.getElementById('status').textContent='Failed to load OpenCV.js'"></script>
+
+<script>
+/* ---------- State ---------- */
+let cvReady = false;
+let stream = null;
+let baseImageData = null; // pristine photo to avoid stacked drawings
+
+/* ---------- Elements ---------- */
+const v = document.getElementById('cam');
+const preview = document.getElementById('preview');
+const statusEl = document.getElementById('status');
+const hintEl = document.getElementById('hint');
+const pipEl = document.getElementById('pipCount');
+
+const startBtn = document.getElementById('startBtn');
+const captureBtn = document.getElementById('captureBtn');
+const retakeBtn = document.getElementById('retakeBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const filePick = document.getElementById('filePick');
+
+const analyzeBtn = document.getElementById('analyzeBtn');
+const autoBtn = document.getElementById('autoBtn');
+
+/* Advanced (hidden by default, used by Auto or manual tweak) */
+const cSlider = document.getElementById('cSlider');
+const minArea = document.getElementById('minArea');
+const maxArea = document.getElementById('maxArea');
+const circSlider = document.getElementById('circSlider');
+
+const cVal = document.getElementById('cVal');
+const minAreaVal = document.getElementById('minAreaVal');
+const maxAreaVal = document.getElementById('maxAreaVal');
+const circVal = document.getElementById('circVal');
+
+[cSlider,minArea,maxArea,circSlider].forEach(inp=>{
+  inp.addEventListener('input', ()=>{
+    cVal.textContent = cSlider.value;
+    minAreaVal.textContent = minArea.value;
+    maxAreaVal.textContent = maxArea.value;
+    circVal.textContent = Number(circSlider.value).toFixed(2);
+  });
+});
+
+/* ---------- OpenCV init ---------- */
+function cvIsLoading(){
+  cv['onRuntimeInitialized'] = ()=>{
+    cvReady = true;
+    statusEl.textContent = 'OpenCV ready';
+    setHint('Tap “Start Camera”, then “Take Photo”, then “Analyze”.');
+  };
+}
+
+/* ---------- Utils ---------- */
+function setHint(msg){ hintEl.textContent = msg || ''; }
+function clearHint(){ setHint(''); }
+
+async function startCamera(){
+  clearHint();
+  pipEl.textContent = 0;
+  baseImageData = null;
+
+  // Clear the preview
+  const ctx = preview.getContext('2d');
+  ctx.clearRect(0,0,preview.width,preview.height);
+
+  statusEl.textContent = 'Requesting camera…';
+  showVideo(true);
+
+  // stop any previous stream
+  if(stream){ try{ stream.getTracks().forEach(t=>t.stop()); }catch(e){} }
+
+  // Try environment camera; fall back to any
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width:{ideal:1280}, height:{ideal:720} },
+      audio: false
+    });
+  }catch(e){
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }catch(e2){
+      statusEl.textContent = 'Camera error';
+      setHint('Allow camera permission and use HTTPS or localhost.');
+      return;
+    }
+  }
+
+  v.srcObject = stream;
+
+  // Some browsers require an explicit play() after a user gesture
+  try { await v.play(); }
+  catch(e){ setHint('If you see a paused icon, tap the video to start.'); }
+
+  // Wait for metadata so videoWidth/videoHeight are available
+  await new Promise(r => {
+    if (v.readyState >= 1) return r();
+    v.onloadedmetadata = r;
+  });
+
+  // If dimensions are still zero, give a helpful hint
+  if (!v.videoWidth || !v.videoHeight){
+    setHint('Camera started, but no video frames yet. Try switching apps or rotating the device once.');
+  }
+
+  fitCanvasToVideo();
+  statusEl.textContent = 'Camera ready';
+  startBtn.style.display = 'none';
+  captureBtn.style.display = 'inline-block';
+  retakeBtn.style.display = 'none';
+}
+
+function showVideo(show){
+  v.style.display = show ? 'block' : 'none';
+  preview.classList.toggle('overlay', show);
+  if(show){
+    captureBtn.style.display = (startBtn.style.display==='none') ? 'inline-block' : 'none';
+    retakeBtn.style.display = 'none';
+  }else{
+    captureBtn.style.display = 'none';
+    retakeBtn.style.display = 'inline-block';
+  }
+}
+
+function fitCanvasToVideo(){
+  const W = v.videoWidth || 640, H = v.videoHeight || 480;
+  preview.width = W; preview.height = H;
+  const ctx = preview.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+}
+
+function capturePhoto(){
+  const W = v.videoWidth, H = v.videoHeight;
+  const ctx = preview.getContext('2d');
+  preview.classList.remove('overlay');
+  ctx.drawImage(v, 0, 0, W, H);
+  // save pristine copy
+  baseImageData = ctx.getImageData(0, 0, W, H);
+  showVideo(false);
+  statusEl.textContent = 'Photo captured — ready to analyze';
+}
+
+function loadImageToCanvas(file){
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = ()=>{
+    preview.width = img.naturalWidth; preview.height = img.naturalHeight;
+    const ctx = preview.getContext('2d');
+    preview.classList.remove('overlay');
+    ctx.drawImage(img, 0, 0, preview.width, preview.height);
+    baseImageData = ctx.getImageData(0, 0, preview.width, preview.height);
+    showVideo(false);
+    URL.revokeObjectURL(url);
+    startBtn.style.display = 'inline-block';
+    statusEl.textContent = 'Photo loaded — ready to analyze';
+  };
+  img.src = url;
+}
+
+function matFromCanvas(canvas){
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
+  let src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+  src.data.set(imgData.data);
+  let rgb = new cv.Mat();
+  cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  src.delete();
+  return rgb;
+}
+
+/* ---------- Detection (full image; no ROI) ---------- */
+function detectPips(C, minA, maxA, minCirc, draw=false){
+  const W = preview.width, H = preview.height;
+  if(!W || !H) return {count:0};
+
+  // Always start from the pristine image if we have one
+  const vis = preview.getContext('2d');
+  if(baseImageData) vis.putImageData(baseImageData, 0, 0);
+
+  // Build an offscreen canvas with the clean photo (so detection isn't influenced by drawn dots)
+  const off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  const offCtx = off.getContext('2d');
+  if(baseImageData) offCtx.putImageData(baseImageData, 0, 0);
+  else offCtx.drawImage(preview, 0, 0);
+
+  // OpenCV pipeline
+  let frame = matFromCanvas(off);
+  let gray = new cv.Mat(), blur = new cv.Mat(), bin = new cv.Mat(), opened = new cv.Mat();
+  cv.cvtColor(frame, gray, cv.COLOR_RGB2GRAY);
+  cv.equalizeHist(gray, gray);
+  cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0);
+  cv.adaptiveThreshold(blur, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 35, C);
+
+  let kernel = cv.Mat.ones(3,3, cv.CV_8U);
+  cv.morphologyEx(bin, opened, cv.MORPH_OPEN, kernel);
+
+  // Find contours on the whole image
+  let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+  cv.findContours(opened, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  if(draw){ vis.fillStyle = '#7ee787'; }
+
+  let count = 0;
+  for(let i=0;i<contours.size();i++){
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if(area < minA || area > maxA){ cnt.delete(); continue; }
+    const peri = cv.arcLength(cnt, true);
+    const circ = (peri>0)? (4*Math.PI*area)/(peri*peri) : 0;
+    if(circ < minCirc){ cnt.delete(); continue; }
+    const m = cv.moments(cnt);
+    if(m.m00 !== 0){
+      if(draw){
+        const cx = Math.round(m.m10/m.m00);
+        const cy = Math.round(m.m01/m.m00);
+        vis.beginPath(); vis.arc(cx, cy, 8, 0, Math.PI*2); vis.fill();
+      }
+      count++;
+    }
+    cnt.delete();
+  }
+
+  // Cleanup
+  kernel.delete(); contours.delete(); hierarchy.delete();
+  frame.delete(); gray.delete(); blur.delete(); bin.delete(); opened.delete();
+
+  return {count};
+}
+
+/* ---------- Manual analyze ---------- */
+function analyzeCurrentFrame(){
+  if(!cvReady){ statusEl.textContent='OpenCV not ready'; return; }
+  if(!preview.width){ statusEl.textContent='No image to analyze'; return; }
+  const C = parseInt(cSlider.value,10);
+  const minA = parseInt(minArea.value,10);
+  const maxA = parseInt(maxArea.value,10);
+  const minCirc = parseFloat(circSlider.value);
+  const result = detectPips(C, minA, maxA, minCirc, true);
+  pipEl.textContent = result.count;
+  statusEl.textContent = `Analyzed (${result.count} pips)`;
+}
+
+/* ---------- Auto analyze ---------- */
+function autoAnalyze(){
+  if(!cvReady){ statusEl.textContent='OpenCV not ready'; return; }
+  if(!preview.width){ statusEl.textContent='No image to analyze'; return; }
+
+  let bestScore = -Infinity, best = null, bestCount = 0;
+
+  for(let C=-4; C<=8; C+=2){
+    for(let minA=20; minA<=60; minA+=10){
+      for(let maxA=800; maxA<=2000; maxA+=400){
+        for(let circ=0.4; circ<=0.75; circ+=0.1){
+          const {count} = detectPips(C, minA, maxA, circ, false);
+          const score = (count>0 && count<40) ? count : -1;
+          if(score > bestScore){
+            bestScore = score;
+            best = {C, minA, maxA, circ};
+            bestCount = count;
+          }
+        }
+      }
+    }
+  }
+
+  if(best){
+    // Sync advanced controls (hidden) so manual Analyze matches auto choice
+    cSlider.value = best.C; cVal.textContent = best.C;
+    minArea.value = best.minA; minAreaVal.textContent = best.minA;
+    maxArea.value = best.maxA; maxAreaVal.textContent = best.maxA;
+    circSlider.value = best.circ; circVal.textContent = best.circ.toFixed(2);
+
+    const result = detectPips(best.C, best.minA, best.maxA, best.circ, true);
+    pipEl.textContent = result.count;
+    statusEl.textContent = `Auto tuned ✔️ → ${bestCount} pips`;
+  }else{
+    statusEl.textContent = 'Auto tuning found no reliable dots';
+  }
+}
+
+/* ---------- Events ---------- */
+startBtn.addEventListener('click', startCamera);
+captureBtn.addEventListener('click', capturePhoto);
+retakeBtn.addEventListener('click', startCamera);
+uploadBtn.addEventListener('click', ()=> filePick.click());
+filePick.addEventListener('change', (e)=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  loadImageToCanvas(f);
+  pipEl.textContent = 0;
+});
+analyzeBtn.addEventListener('click', analyzeCurrentFrame);
+autoBtn.addEventListener('click', autoAnalyze);
+
+// Keep canvas sized to video; resume if tab becomes visible again
+v.addEventListener('loadedmetadata', fitCanvasToVideo);
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden && v.srcObject){
+    v.play().catch(()=>{ /* ignore */ });
+  }
+});
+</script>
+</body>
+</html>
